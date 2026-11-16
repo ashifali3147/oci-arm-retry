@@ -1,0 +1,78 @@
+name: OCI ARM retry
+
+on:
+  schedule:
+    # Every 15 minutes, off the top of the hour (GitHub cron is UTC and best-effort).
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: oci-arm-retry
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+  issues: write
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+      OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_REGION: ${{ secrets.OCI_REGION }}
+      OCI_STACK_OCID: ${{ secrets.OCI_STACK_OCID }}
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+      INSTANCE_NAME: ashif-free-arm
+    steps:
+      - name: Mask secrets
+        run: |
+          for v in "$OCI_USER_OCID" "$OCI_TENANCY_OCID" "$OCI_FINGERPRINT" "$OCI_STACK_OCID"; do
+            [ -n "$v" ] && echo "::add-mask::$v"
+          done
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install OCI CLI
+        run: pip install -r requirements.txt
+
+      - name: Write OCI config
+        env:
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_USER_OCID}
+          fingerprint=${OCI_FINGERPRINT}
+          tenancy=${OCI_TENANCY_OCID}
+          region=${OCI_REGION}
+          key_file=~/.oci/key.pem
+          EOF
+          chmod 600 ~/.oci/config
+
+      - name: Retry Apply
+        id: retry
+        run: bash scripts/retry.sh
+
+      - name: Stop retrying
+        if: steps.retry.outputs.vm_ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "Oracle ARM VM is ready" \
+            --body "The \`$INSTANCE_NAME\` VM exists. The retry workflow has been disabled. Next: SSH in as \`ubuntu\`, then delete the OCI API key and the repo secrets." \
+            || echo "Could not open the issue."
+          gh workflow disable oci-arm-retry.yml --repo "$GITHUB_REPOSITORY"
+          echo "Workflow disabled." >> "$GITHUB_STEP_SUMMARY"
