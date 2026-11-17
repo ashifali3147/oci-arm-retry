@@ -27,7 +27,8 @@ jobs:
       OCI_STACK_OCID: ${{ secrets.OCI_STACK_OCID }}
       OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
       INSTANCE_NAME: ashif-free-arm
-      ATTEMPTS: "6"
+      ATTEMPTS: "3"
+      ATTEMPT_GAP_SECONDS: "180"
     steps:
       - name: Mask secrets
         run: |
