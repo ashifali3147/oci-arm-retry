@@ -2,7 +2,8 @@
 # Retries the Resource Manager Apply job that creates the Always Free ARM VM.
 #
 # Exit codes:
-#   0  VM exists / was created, an Apply is already running, or there was no capacity
+#   0  VM exists / was created, an Apply is already running, there was no capacity,
+#      or OCI rate-limited the request (HTTP 429)
 #   1  any other failure (bad credentials, wrong OCID, Terraform error, ...)
 #
 # Writes "vm_ready=true" to $GITHUB_OUTPUT once the VM exists.
@@ -20,6 +21,8 @@ POLL_SECONDS=15
 
 OUTPUT_FILE="${GITHUB_OUTPUT:-/dev/null}"
 SUMMARY_FILE="${GITHUB_STEP_SUMMARY:-/dev/null}"
+RATE_LIMIT_FLAG="${TMPDIR:-/tmp}/oci-rate-limited.$$"
+RATE_LIMIT_EXIT=75
 
 ist_now() { TZ=Asia/Kolkata date '+%d %b %Y, %I:%M %p IST'; }
 
@@ -39,12 +42,46 @@ summary() {
   } >> "$SUMMARY_FILE"
 }
 
+# Runs an oci command. On HTTP 429 (TooManyRequests) it records the fact and exits
+# with RATE_LIMIT_EXIT, which the EXIT trap turns into a clean "retry next run".
+# Any other error is printed (redacted) and returned as a failure.
+oci_call() {
+  local out err rc=0
+  err=$(mktemp)
+  out=$(oci "$@" 2>"$err") || rc=$?
+  if (( rc == 0 )); then
+    rm -f "$err"
+    printf '%s' "$out"
+    return 0
+  fi
+  if grep -qE 'TooManyRequests|"status": 429' "$err"; then
+    rm -f "$err"
+    touch "$RATE_LIMIT_FLAG"
+    exit "$RATE_LIMIT_EXIT"
+  fi
+  redact <"$err" >&2
+  rm -f "$err"
+  return "$rc"
+}
+
+on_exit() {
+  local rc=$?
+  if [[ -f "$RATE_LIMIT_FLAG" ]]; then
+    rm -f "$RATE_LIMIT_FLAG"
+    log "Rate-limited by OCI (429 TooManyRequests) – will retry next run."
+    summary "🚦 Rate-limited by OCI, will retry next run"
+    exit 0
+  fi
+  exit "$rc"
+}
+trap on_exit EXIT
+
 instance_count() {
   local out
-  out=$(oci compute instance list \
+  out=$(oci_call compute instance list \
     --compartment-id "$OCI_TENANCY_OCID" \
     --display-name "$INSTANCE_NAME" \
-    --all)
+    --all) || return
   if [[ -z "$out" ]]; then
     echo 0
     return
@@ -54,7 +91,7 @@ instance_count() {
 
 active_job_count() {
   local out
-  out=$(oci resource-manager job list --stack-id "$OCI_STACK_OCID" --all)
+  out=$(oci_call resource-manager job list --stack-id "$OCI_STACK_OCID" --all) || return
   if [[ -z "$out" ]]; then
     echo 0
     return
@@ -69,15 +106,15 @@ mark_ready() {
 # Runs one Apply job and waits for it. Sets JOB_ID and JOB_STATE.
 run_apply() {
   local waited=0
-  JOB_ID=$(oci resource-manager job create-apply-job \
+  JOB_ID=$(oci_call resource-manager job create-apply-job \
     --stack-id "$OCI_STACK_OCID" \
     --execution-plan-strategy AUTO_APPROVED \
-    --query 'data.id' --raw-output)
+    --query 'data.id' --raw-output) || return
   echo "::add-mask::$JOB_ID"
 
   while :; do
-    JOB_STATE=$(oci resource-manager job get --job-id "$JOB_ID" \
-      --query 'data."lifecycle-state"' --raw-output)
+    JOB_STATE=$(oci_call resource-manager job get --job-id "$JOB_ID" \
+      --query 'data."lifecycle-state"' --raw-output) || return
     case "$JOB_STATE" in
       SUCCEEDED|FAILED|CANCELED) return ;;
     esac
@@ -91,7 +128,7 @@ run_apply() {
 }
 
 job_logs() {
-  oci resource-manager job get-job-logs --job-id "$JOB_ID" --all \
+  oci_call resource-manager job get-job-logs --job-id "$JOB_ID" --all \
     | jq -r '.data[]?.message // empty'
 }
 
